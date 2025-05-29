@@ -1,0 +1,1 @@
+# SigilStack Worker Definitions
