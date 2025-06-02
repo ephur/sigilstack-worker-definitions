@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+
+import requests
+import json
+import os
+def set_authoritative_dns_servers():
+    # Load the domains from the environment variable
+    domains = os.getenv('DOMAINS', '').split(',')
+    if not domains:
+        print("No domains found to update.")
+        return
+
+    # Porkbun API endpoint and key
+    porkbun_api_url = "https://porkbun.com/api/json/v3/dns/update"
+    api_key = os.getenv('PORKBUN_API_KEY')
+    secret_key = os.getenv('PORKBUN_SECRET_KEY')
+
+    for domain in domains:
+        domain = domain.strip()
+        if not domain:
+            continue
+
+        payload = {
+            'apikey': api_key,
+            'secretkey': secret_key,
+            'domain': domain,
+            'nameservers': ['ns1.porkbun.com', 'ns2.porkbun.com']
+        }
+
+        response = requests.post(porkbun_api_url, json=payload)
+
+        if response.status_code == 200:
+            print(f"Successfully updated DNS servers for {domain}")
+        else:
+            print(f"Failed to update DNS servers for {domain}: {response.text}")
+
+if __name__ == "__main__":
+    set_authoritative_dns_servers()
+# This script is intended to be run as a post_apply hook in a Terraform configuration
+# It will set the authoritative DNS servers for each domain using the Porkbun API
+# Ensure you have the required environment variables set:
+# - DOMAINS: Comma-separated list of domains to update
+# - PORKBUN_API_KEY: Your Porkbun API key
+# - PORKBUN_SECRET_KEY: Your Porkbun secret key
+# Make sure to install the requests library if not already installed
+# pip install requests
