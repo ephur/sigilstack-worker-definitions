@@ -1,46 +1,373 @@
 #!/usr/bin/env python3
+"""Post-apply hook for synchronizing DNS nameservers across providers."""
 
-import requests
 import json
+import logging
 import os
-def set_authoritative_dns_servers():
-    # Load the domains from the environment variable
-    domains = os.getenv('DOMAINS', '').split(',')
-    if not domains:
-        print("No domains found to update.")
-        return
+import sys
+from datetime import datetime
 
-    # Porkbun API endpoint and key
-    porkbun_api_url = "https://porkbun.com/api/json/v3/dns/update"
-    api_key = os.getenv('PORKBUN_API_KEY')
-    secret_key = os.getenv('PORKBUN_SECRET_KEY')
+import boto3
+import requests
+from pydantic import BaseModel, ValidationError
 
-    for domain in domains:
-        domain = domain.strip()
-        if not domain:
+
+class PorkbunAPIError(Exception):
+    """Custom exception for Porkbun API errors."""
+
+
+#####################
+### LOGGING SETUP ###
+#####################
+class JsonFormatter(logging.Formatter):
+    """
+    Custom JSON formatter for logging.
+    """
+
+    def format(self, record):
+        log_entry = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "severity": record.levelname,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            log_entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_entry)
+
+
+def setup_logging():
+    """Initializes and configures the logging system for JSON output."""
+    log_level_str = os.environ.get("LOG_LEVEL", "INFO").upper()
+    log_level = getattr(logging, log_level_str, logging.INFO)
+
+    logger_inner = logging.getLogger("sigilstack")
+    logger_inner.setLevel(log_level)
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+    logger_inner.handlers.clear()
+    logger_inner.addHandler(handler)
+    return logger_inner
+
+
+logger = setup_logging()
+
+
+class AppState(BaseModel):
+    """Configuration model for API credentials and tokens.
+
+    Attributes:
+        porkbun_apikey (str): Porkbun API key.
+        porkbun_apisecret (str): Porkbun API secret.
+        cloudflare_token (str): Cloudflare API token.
+    """
+
+    porkbun_apikey: str
+    porkbun_apisecret: str
+    cloudflare_token: str
+
+    @classmethod
+    def from_env(cls) -> "AppState":
+        """Creates a AppState instance from environment variables.
+
+        Returns:
+            AppState: The populated AppState object.
+
+        Raises:
+            ValidationError: If any required variables are missing or invalid.
+        """
+        return cls(
+            porkbun_apikey=os.environ["PORKBUN_APIKEY"],
+            porkbun_apisecret=os.environ["PORKBUN_APISECRET"],
+            cloudflare_token=os.environ["CLOUDFLARE_API_TOKEN"],
+        )
+
+
+#########################
+### ROUTE53 FUNCTIONS ###
+#########################
+def get_route53_name_servers() -> dict[str, list[str]]:
+    """Fetches Route53 hosted zones and extracts their authoritative NS records.
+
+    Returns:
+        dict[str, list[str]]: Mapping from domain to list of nameservers.
+    """
+    logger.info("fetching route53 zones and nameservers")
+    client = boto3.client("route53")
+    hosted_zones: list[dict] = client.list_hosted_zones()["HostedZones"]
+    domain_ns: dict[str, list[str]] = {}
+    for zone in hosted_zones:
+        zone_id: str = zone["Id"].split("/")[-1]
+        records: list[dict] = client.list_resource_record_sets(HostedZoneId=zone_id)[
+            "ResourceRecordSets"
+        ]
+        for record in records:
+            if record["Type"] == "NS" and record["Name"].rstrip(".") == zone[
+                "Name"
+            ].rstrip("."):
+                domain: str = zone["Name"].rstrip(".")
+                domain_ns[domain] = [ns["Value"] for ns in record["ResourceRecords"]]
+    logger.debug(
+        {
+            "message": "Route53 NS records fetched",
+            "zones_count": len(hosted_zones),
+            "domains": list(domain_ns.keys()),
+        }
+    )
+    return domain_ns
+
+
+############################
+### CLOUDFLARE FUNCTIONS ###
+############################
+def get_cloudflare_name_servers(app_state: AppState) -> dict[str, list[str]]:
+    """Fetches Cloudflare zones and their corresponding nameservers.
+
+    Args:
+        app_state (AppState): The configuration object containing the Cloudflare token.
+
+    Returns:
+        dict[str, list[str]]: Mapping from domain to list of nameservers.
+    """
+    logger.info("fetching Cloudflare zones and nameservers")
+    token: str = app_state.cloudflare_token
+    headers: dict[str, str] = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    resp: requests.Response = requests.get(
+        "https://api.cloudflare.com/client/v4/zones", headers=headers, timeout=10
+    )
+    zones: list[dict] = resp.json().get("result", [])
+    logger.debug(
+        "Cloudflare API response status: %d, zones returned: %d",
+        resp.status_code,
+        len(zones),
+    )
+    domain_ns: dict[str, list[str]] = {}
+    for zone in zones:
+        domain_ns[zone["name"]] = zone.get("name_servers", [])
+    logger.debug(
+        {
+            "message": "Cloudflare NS records fetched",
+            "zones_count": len(zones),
+            "domains": list(domain_ns.keys()),
+        }
+    )
+    return domain_ns
+
+
+#########################
+### PORKBUN FUNCTIONS ###
+#########################
+def porkbun_request(
+    endpoint: str, app_state: "AppState", payload: dict | None = None
+) -> dict:
+    """
+    Lightweight Porkbun API request helper.
+
+    Args:
+        endpoint (str): Porkbun API endpoint after /api/json/v3/,
+                        e.g. 'domain/listAll' or 'domain/getNs/example.com'
+        payload (dict): Additional payload data (excluding auth).
+        app_state (AppState): Configuration object with Porkbun credentials.
+
+    Returns:
+        dict: Parsed JSON response.
+
+    Raises:
+        PorkbunAPIError: If the request fails or returns non-200 status.
+    """
+    if payload is None:
+        payload = {}
+    url = f"https://api.porkbun.com/api/json/v3/{endpoint}"
+    headers = {"Content-Type": "application/json"}
+    req_payload = {
+        "apikey": app_state.porkbun_apikey,
+        "secretapikey": app_state.porkbun_apisecret,
+        **payload,
+    }
+    resp = requests.post(url, headers=headers, json=req_payload, timeout=10)
+    try:
+        resp_json = resp.json()
+    except json.JSONDecodeError:
+        logger.error("Failed to parse JSON response from Porkbun API: %s", resp.text)
+        resp_json = {}
+    if resp.status_code != 200:
+        raise PorkbunAPIError(
+            f"Porkbun API call to {endpoint} failed: {resp.status_code} {resp.text}"
+        )
+    return resp_json
+
+
+def get_porkbun_domains(app_state: AppState) -> list[str]:
+    """Fetches the list of domains from Porkbun."""
+    logger.info("fetching Porkbun domains")
+    try:
+        resp_json = porkbun_request("domain/listAll", app_state=app_state)
+        domains_list = resp_json.get("domains", [])
+        logger.debug(
+            {
+                "message": "Porkbun domains fetched successfully",
+                "domains_count": len(domains_list),
+                "domains": domains_list,
+            }
+        )
+    except requests.RequestException as e:
+        logger.error("Porkbun API error fetching domains: %s", e)
+        domains_list = []
+
+    logger.debug(
+        {
+            "message": "Porkbun domains fetched",
+            "domains_count": len(domains_list),
+            "domains": domains_list,
+        }
+    )
+    return domains_list
+
+
+def get_current_porkbun_ns(domain: str, app_state: AppState) -> list[str]:
+    """Fetches the current NS records for a domain from Porkbun."""
+    logger.debug("Fetching current NS records for %s from Porkbun", domain)
+    try:
+        resp_json = porkbun_request(f"domain/getNs/{domain}", app_state=app_state)
+        ns_list = resp_json.get("ns", [])
+        records_count = len(ns_list)
+    except requests.RequestException as e:
+        logger.error("Porkbun NS records fetch for %s error: %s", domain, e)
+        return []
+    logger.debug(
+        "Porkbun NS records fetch for %s records retrieved: %d", domain, records_count
+    )
+    return ns_list if isinstance(ns_list, list) else []
+
+
+def get_all_porkbun_ns(
+    porkbun_domains: list, app_state: AppState
+) -> dict[str, list[str]]:
+    """Fetches NS records for all domains from Porkbun in one go.
+
+    Args:
+        porkbun_domains (list): List of domains to fetch NS records for.
+        app_state (AppState): The configuration object.
+
+    Returns:
+        dict[str, list[str]]: Mapping of domain to its NS records.
+    """
+    logger.info("Fetching NS records for all Porkbun domains")
+    domain_ns_map = {}
+    for domain in porkbun_domains:
+        if isinstance(domain, dict) and "domain" in domain:
+            domain_name = domain["domain"]
+        elif isinstance(domain, str):
+            domain_name = domain
+        else:
+            logger.warning("Skipping invalid domain entry: %s", domain)
             continue
 
-        payload = {
-            'apikey': api_key,
-            'secretkey': secret_key,
-            'domain': domain,
-            'nameservers': ['ns1.porkbun.com', 'ns2.porkbun.com']
+        ns_records = get_current_porkbun_ns(domain_name, app_state)
+        domain_ns_map[domain_name] = ns_records
+    logger.debug(
+        {
+            "message": "Porkbun NS records fetched for all domains",
+            "domains_count": len(domain_ns_map),
+            "domains": list(domain_ns_map.keys()),
         }
+    )
+    return domain_ns_map
 
-        response = requests.post(porkbun_api_url, json=payload)
 
-        if response.status_code == 200:
-            print(f"Successfully updated DNS servers for {domain}")
+def update_porkbun_ns(domain: str, nameservers: list[str], app_state: AppState) -> None:
+    """Updates the NS records for a domain in Porkbun."""
+    try:
+        porkbun_request(
+            f"domain/updateNs/{domain}",
+            payload={"ns": nameservers},
+            app_state=app_state,
+        )
+        logger.info("Porkbun update nameservers for %s succeeded", domain)
+    except requests.RequestException as e:
+        logger.error("Porkbun update nameservers for %s error: %s", domain, e)
+
+
+###########################
+### ORCHESTRATION LOGIC ###
+###########################
+def sync_nameservers(app_state: AppState) -> None:
+    """Synchronizes nameservers for domains in Porkbun with those in Route53 and Cloudflare.
+
+    Args:
+        app_state (AppState): The configuration object containing credentials for all providers.
+    """
+    route53_ns: dict[str, list[str]] = get_route53_name_servers()
+    cf_ns: dict[str, list[str]] = get_cloudflare_name_servers(app_state)
+    porkbun_domains: list[str] = get_porkbun_domains(app_state)
+    all_desired: dict[str, list[str]] = {}
+    for source in (route53_ns, cf_ns):
+        for domain, ns_list in source.items():
+            all_desired.setdefault(domain, []).extend(ns_list)
+    for domain in all_desired:
+        all_desired[domain] = sorted(set(all_desired[domain]))
+    logger.debug(
+        {
+            "message": "Consolidated desired nameservers",
+            "domains_count": len(all_desired),
+            "domains": all_desired,
+        }
+    )
+
+    # Fetch all Porkbun NS records once
+    porkbun_ns: dict[str, list[str]] = get_all_porkbun_ns(porkbun_domains, app_state)
+
+    for domain, desired_ns in all_desired.items():
+        logger.debug("Checking if %s is in Porkbun domains list.", domain)
+        domain_entry = next(
+            (
+                d
+                for d in porkbun_domains
+                if (d.get("domain") if isinstance(d, dict) else d) == domain
+            ),
+            None,
+        )
+        lock_status = "unknown"
+        if domain_entry:
+            if isinstance(domain_entry, dict):
+                lock_status = domain_entry.get("securityLock", "unknown")
+            current_ns = porkbun_ns.get(domain, [])
+            logger.debug(
+                {
+                    "message": "Domain %s found in Porkbun account",
+                    "lock_status": lock_status,
+                    "current_ns": current_ns,
+                    "desired_ns": desired_ns,
+                },
+                domain,
+            )
+            if sorted(current_ns) != sorted(desired_ns):
+                logger.info("Updating %s to use %s", domain, desired_ns)
+                update_porkbun_ns(domain, desired_ns, app_state)
+            else:
+                logger.debug(
+                    {
+                        "message": f"{domain} already has correct nameservers",
+                        "current_ns": current_ns,
+                        "desired_ns": desired_ns,
+                    }
+                )
         else:
-            print(f"Failed to update DNS servers for {domain}: {response.text}")
+            # not all domains will be found in porkbun, we use other registrars
+            logger.debug(
+                {
+                    "message": "%s not found in Porkbun domains list, skipping",
+                },
+                domain,
+            )
+
 
 if __name__ == "__main__":
-    set_authoritative_dns_servers()
-# This script is intended to be run as a post_apply hook in a Terraform configuration
-# It will set the authoritative DNS servers for each domain using the Porkbun API
-# Ensure you have the required environment variables set:
-# - DOMAINS: Comma-separated list of domains to update
-# - PORKBUN_API_KEY: Your Porkbun API key
-# - PORKBUN_SECRET_KEY: Your Porkbun secret key
-# Make sure to install the requests library if not already installed
-# pip install requests
+    try:
+        state: AppState = AppState.from_env()
+    except ValidationError as e:
+        print("Configuration error:", e)
+        sys.exit(1)
+    sync_nameservers(state)

@@ -1,3 +1,8 @@
+variable "cloudflare_account_name" {
+  description = "Name of the Cloudflare account to use for DNS management"
+  type        = string
+}
+
 variable "force_apply" {
   description = "If true, generates a unique value to force apply. If false, uses a stable value from external source."
   type        = bool

@@ -12,17 +12,31 @@ resource "null_resource" "validate_domain_record_count" {
   }
 }
 
-data "dns_txt_records" "domains" {
-  name = "_domains.ephur.net"
+data "dns_txt_record_set" "domains" {
+  host = "_domains.ephur.net"
 }
 
 resource "cloudflare_zone" "domains" {
-  for_each = toset(data.dns_txt_records.domains.records)
+  for_each = {
+    for domain in data.dns_txt_record_set.domains.records :
+    domain => domain
+    if split(".", domain)[0] == "sigilstack"
+  }
 
-  zone = each.value
+  name = each.value
+  type = "full"
+
+  account = {
+    id = data.cloudflare_account.this.account_id
+  }
 }
+
 resource "aws_route53_zone" "domains" {
-  for_each = toset(data.dns_txt_records.domains.records)
+  for_each = {
+    for domain in data.dns_txt_record_set.domains.records :
+    domain => domain
+    if split(".", domain)[0] == "ephur"
+  }
 
   name = each.value
 }
@@ -32,7 +46,7 @@ data "aws_ssm_parameter" "force_seed" {
 }
 
 module "write_force_seed" {
-  source        = "./modules/force-seed-write"
+  source        = "./force_seed"
   ssm_parameter = "/sigilstack/definitions/coredns/force_seed"
   seed_value    = local.force_apply_seed
 }
