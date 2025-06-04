@@ -20,7 +20,7 @@ resource "cloudflare_zone" "domains" {
   for_each = {
     for domain in data.dns_txt_record_set.domains.records :
     domain => domain
-    if split(".", domain)[0] == "sigilstack"
+    if (split(".", domain)[0] == "sigilstack" || split(".", domain)[0] == "richardmaynard")
   }
 
   name = each.value

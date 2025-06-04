@@ -186,7 +186,10 @@ def porkbun_request(
         "secretapikey": app_state.porkbun_apisecret,
         **payload,
     }
-    resp = requests.post(url, headers=headers, json=req_payload, timeout=10)
+    try:
+        resp = requests.post(url, headers=headers, json=req_payload, timeout=10)
+    except requests.exceptions.ReadTimeout:
+        raise PorkbunAPIError(f"Porkbun API request to {endpoint} timed out")
     try:
         resp_json = resp.json()
     except json.JSONDecodeError:
@@ -286,8 +289,13 @@ def update_porkbun_ns(domain: str, nameservers: list[str], app_state: AppState) 
             app_state=app_state,
         )
         logger.info("Porkbun update nameservers for %s succeeded", domain)
-    except requests.RequestException as e:
-        logger.error("Porkbun update nameservers for %s error: %s", domain, e)
+    except PorkbunAPIError as e:
+        if "securityLock" in str(e):
+            logger.error(
+                "Porkbun update nameservers for %s failed: Domain is locked", domain
+            )
+        else:
+            logger.error("Porkbun update nameservers for %s error: %s", domain, e)
 
 
 ###########################
