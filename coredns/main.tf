@@ -16,11 +16,24 @@ data "dns_txt_record_set" "domains" {
   host = "_domains.ephur.net"
 }
 
+locals {
+  filtered_aws_domains = [
+    for d in data.dns_txt_record_set.domains.records : d
+    if contains(local.aws_domains, element(
+      split(".", d), length(split(".", d)) - 2)
+    )
+  ]
+
+  filtered_cloudflare_domains = [
+    for d in data.dns_txt_record_set.domains.records : d
+    if contains(local.cloudflare_domains, element(
+      split(".", d), length(split(".", d)) - 2)
+    )
+  ]
+}
+
 resource "cloudflare_zone" "domains" {
-  for_each = {
-    for domain in data.dns_txt_record_set.domains.records :
-    domain => domain
-    if (split(".", domain)[0] == "sigilstack" || split(".", domain)[0] == "richardmaynard")
+  for_each = { for d in local.filtered_cloudflare_domains : d => d
   }
 
   name = each.value
@@ -32,13 +45,11 @@ resource "cloudflare_zone" "domains" {
 }
 
 resource "aws_route53_zone" "domains" {
-  for_each = {
-    for domain in data.dns_txt_record_set.domains.records :
-    domain => domain
-    if split(".", domain)[0] == "ephur"
+  for_each = { for d in local.filtered_aws_domains : d => d
   }
 
   name = each.value
+  comment = "Managed by SigilStack"
 }
 
 data "aws_ssm_parameter" "force_seed" {
